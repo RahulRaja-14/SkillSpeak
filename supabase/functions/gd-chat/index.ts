@@ -94,24 +94,30 @@ Return a JSON object with:
 
 Keep the discussion dynamic and engaging. Challenge the user's points constructively.`;
 
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${LOVABLE_API_KEY}`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${LOVABLE_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemini-2.0-flash",
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...messages.map(m => ({
-            role: m.role === "user" ? "user" : "assistant",
-            content: m.speaker ? `[${m.speaker}]: ${m.content}` : m.content
-          })),
-          ...(isStart ? [] : isAIInitiating ? [{ role: "user", content: "No one has spoken yet. One participant should start the discussion now." }] : [{ role: "user", content: "Generate participant responses to continue the GD." }])
-        ],
-        max_tokens: 500,
-        response_format: { type: "json_object" }
+        system_instruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        contents: messages.length > 0
+          ? messages.map(m => ({
+            role: m.role === "user" ? "user" : "model",
+            parts: [{ text: m.speaker ? `[${m.speaker}]: ${m.content}` : m.content }]
+          }))
+          : [
+            {
+              role: "user",
+              parts: [{ text: isStart ? "Start the discussion as the Moderator." : "One participant should start the discussion now." }]
+            }
+          ],
+        generationConfig: {
+          maxOutputTokens: 500,
+          responseMimeType: "application/json",
+        }
       }),
     });
 
@@ -120,8 +126,18 @@ Keep the discussion dynamic and engaging. Challenge the user's points constructi
       throw new Error(`AI API error: ${error}`);
     }
 
-    const data = await response.json() as ChatCompletionResponse;
-    const content = data.choices[0]?.message?.content || '{"responses":[],"shouldEnd":false}';
+    interface GeminiResponse {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{
+            text?: string;
+          }>;
+        };
+      }>;
+    }
+
+    const data = await response.json() as GeminiResponse;
+    const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '{"responses":[],"shouldEnd":false}';
 
     let parsed;
     try {

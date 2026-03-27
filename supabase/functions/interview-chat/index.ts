@@ -69,20 +69,27 @@ GENERAL INTERVIEW GUIDELINES:
 EVALUATION (When user says "end interview"):
 Simply provide a brief closing greeting, thank the candidate for their time, and acknowledge that the interview has ended. Do NOT generate a long evaluation report here, as it will be generated separately.`;
 
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${LOVABLE_API_KEY}`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${LOVABLE_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemini-2.0-flash",
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...messages,
-          ...(messages.length === 0 ? [{ role: "user", content: "The candidate is ready. Please start the interview by introducing yourself and asking the first question." }] : [])
-        ],
-        max_tokens: 1000,
+        system_instruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        contents: messages.length > 0
+          ? messages.map(m => ({
+            role: m.role === "user" ? "user" : "model",
+            parts: [{ text: m.content }]
+          }))
+          : [{
+            role: "user",
+            parts: [{ text: "The candidate is ready. Please start the interview by introducing yourself and asking the first question." }]
+          }],
+        generationConfig: {
+          maxOutputTokens: 1000,
+        }
       }),
     });
 
@@ -91,16 +98,18 @@ Simply provide a brief closing greeting, thank the candidate for their time, and
       throw new Error(`AI API error: ${error}`);
     }
 
-    interface ChatCompletionResponse {
-      choices: Array<{
-        message?: {
-          content?: string;
+    interface GeminiResponse {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{
+            text?: string;
+          }>;
         };
       }>;
     }
 
-    const data = await response.json() as ChatCompletionResponse;
-    const reply = data.choices[0]?.message?.content || "I apologize, could you please repeat that?";
+    const data = await response.json() as GeminiResponse;
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || "I apologize, could you please repeat that?";
 
     return new Response(
       JSON.stringify({ reply }),

@@ -1,25 +1,111 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Camera, CameraOff, AlertCircle } from "lucide-react";
+import { Camera, CameraOff, AlertCircle, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
 interface WebcamFeedProps {
   isActive: boolean;
-  onFrameCapture?: (frameData: string) => void;
-  captureInterval?: number; // ms between captures
+  onBehaviorUpdate?: (score: number, messages: string[]) => void;
   className?: string;
 }
 
 export function WebcamFeed({ 
   isActive, 
-  onFrameCapture, 
-  captureInterval = 5000, // Default: capture every 5 seconds
+  onBehaviorUpdate, 
   className 
 }: WebcamFeedProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isAiLoading, setIsAiLoading] = useState(false);
+
+  // MediaPipe references
+  const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
+  const lastVideoTimeRef = useRef(-1);
+  const animationFrameRef = useRef<number>(0);
+
+  const initModel = useCallback(async () => {
+    if (faceLandmarkerRef.current) return;
+    setIsAiLoading(true);
+    try {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+      );
+      const landmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU"
+        },
+        outputFaceBlendshapes: true,
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+      faceLandmarkerRef.current = landmarker;
+    } catch (err) {
+      console.error("Failed to load FaceLandmarker", err);
+    }
+    setIsAiLoading(false);
+  }, []);
+
+  const detectFace = useCallback(() => {
+    if (!videoRef.current || !faceLandmarkerRef.current || !isActive) return;
+
+    const video = videoRef.current;
+    if (video.readyState >= 2) {
+      let startTimeMs = performance.now();
+      if (lastVideoTimeRef.current !== video.currentTime) {
+        lastVideoTimeRef.current = video.currentTime;
+        const results = faceLandmarkerRef.current.detectForVideo(video, startTimeMs);
+        
+        if (onBehaviorUpdate) {
+          if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
+            const blendshapes = results.faceBlendshapes[0].categories;
+            
+            let currentScore = 80; // Baseline good score when facing camera
+            const messages: string[] = [];
+
+            const getScore = (name: string) => blendshapes.find(b => b.categoryName === name)?.score || 0;
+            
+            const smileL = getScore("mouthSmileLeft");
+            const smileR = getScore("mouthSmileRight");
+            const eyeLookInL = getScore("eyeLookInLeft");
+            const eyeLookInR = getScore("eyeLookInRight");
+
+            const smileScore = (smileL + smileR) / 2;
+            const focusScore = (eyeLookInL + eyeLookInR) / 2; // Approximates looking at screen/conversational partners
+
+            // Accurately calculate behavioral score
+            if (smileScore > 0.4) {
+              currentScore += 20;
+              messages.push("Positive engagement detected.");
+            } else if (smileScore < 0.05) {
+              currentScore -= 15;
+              messages.push("Maintain a pleasant, engaging expression.");
+            }
+
+            if (focusScore > 0.6) {
+              currentScore -= 20;
+              messages.push("Maintain eye contact with the camera/panelists.");
+            } else {
+              currentScore += 10;
+              messages.push("Good eye contact.");
+            }
+
+            // Cap between 0 and 100
+            currentScore = Math.max(0, Math.min(100, currentScore));
+            onBehaviorUpdate(currentScore, messages);
+          } else {
+            onBehaviorUpdate(0, ["Face not detected! Please face the camera."]);
+          }
+        }
+      }
+    }
+    
+    if (isActive) {
+      animationFrameRef.current = requestAnimationFrame(detectFace);
+    }
+  }, [isActive, onBehaviorUpdate]);
 
   const startCamera = useCallback(async () => {
     try {
@@ -36,15 +122,22 @@ export function WebcamFeed({
         streamRef.current = stream;
         setHasPermission(true);
         setError(null);
+        
+        // Wait for model, then start detection loop
+        await initModel();
+        detectFace();
       }
     } catch (err) {
       console.error("Camera access error:", err);
       setHasPermission(false);
-      setError("Camera access denied. Please enable camera permissions.");
+      setError("Camera access denied. Please enable camera permissions for behavioral analysis.");
     }
-  }, []);
+  }, [initModel, detectFace]);
 
   const stopCamera = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
@@ -54,24 +147,6 @@ export function WebcamFeed({
     }
   }, []);
 
-  const captureFrame = useCallback(() => {
-    if (!videoRef.current || !canvasRef.current || !onFrameCapture) return;
-
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-
-    if (!ctx || video.readyState !== 4) return;
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.drawImage(video, 0, 0);
-
-    // Convert to base64 (low quality for analysis)
-    const frameData = canvas.toDataURL("image/jpeg", 0.5);
-    onFrameCapture(frameData);
-  }, [onFrameCapture]);
-
   // Start/stop camera based on isActive
   useEffect(() => {
     if (isActive) {
@@ -79,20 +154,12 @@ export function WebcamFeed({
     } else {
       stopCamera();
     }
-
     return () => stopCamera();
   }, [isActive, startCamera, stopCamera]);
 
-  // Capture frames at interval
-  useEffect(() => {
-    if (!isActive || !onFrameCapture || hasPermission !== true) return;
-
-    const interval = setInterval(captureFrame, captureInterval);
-    return () => clearInterval(interval);
-  }, [isActive, hasPermission, captureFrame, captureInterval, onFrameCapture]);
 
   return (
-    <div className={cn("relative rounded-xl overflow-hidden bg-secondary", className)}>
+    <div className={cn("relative rounded-xl overflow-hidden bg-secondary border border-border shadow-md", className)}>
       <video
         ref={videoRef}
         autoPlay
@@ -103,7 +170,6 @@ export function WebcamFeed({
           !hasPermission && "hidden"
         )}
       />
-      <canvas ref={canvasRef} className="hidden" />
 
       {/* Camera off overlay */}
       {!isActive && (
@@ -122,18 +188,20 @@ export function WebcamFeed({
       )}
 
       {/* Loading state */}
-      {isActive && hasPermission === null && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center">
-          <Camera className="h-8 w-8 text-muted-foreground animate-pulse mb-2" />
-          <p className="text-sm text-muted-foreground">Starting camera...</p>
+      {isActive && (hasPermission === null || isAiLoading) && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-background/80 backdrop-blur-sm z-10">
+          <Loader2 className="h-8 w-8 text-primary animate-spin mb-2" />
+          <p className="text-sm text-primary font-medium">
+            {isAiLoading ? "Loading MediaPipe AI Vison..." : "Starting camera..."}
+          </p>
         </div>
       )}
 
       {/* Camera active indicator */}
-      {isActive && hasPermission && (
-        <div className="absolute top-2 left-2 flex items-center gap-1.5 px-2 py-1 rounded-full bg-background/80 backdrop-blur-sm">
-          <div className="h-2 w-2 rounded-full bg-red-500 animate-pulse" />
-          <span className="text-xs text-foreground">Recording</span>
+      {isActive && hasPermission && !isAiLoading && (
+        <div className="absolute top-2 left-2 flex items-center gap-1.5 px-2 py-1 rounded-full bg-background/80 backdrop-blur-sm shadow-sm border border-border">
+          <div className="h-2 w-2 rounded-full bg-green-500 animate-pulse" />
+          <span className="text-xs font-semibold text-foreground">AI Tracking On</span>
         </div>
       )}
     </div>
